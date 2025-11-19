@@ -1,10 +1,10 @@
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 
 from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, Request, Query, Path
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, text
@@ -20,7 +20,7 @@ load_dotenv()
 os.makedirs("uploads", exist_ok=True)
 
 # App setup
-app = FastAPI(title="MBF HR Backend", version="0.1.3")
+app = FastAPI(title="MBF HR Backend", version="0.1.4")
 
 app.add_middleware(
     CORSMiddleware,
@@ -97,7 +97,7 @@ class Employee(EmployeeIn):
 
 class AttendanceIn(BaseModel):
     employee_id: int
-    status: str = Field(..., description="clock_in or clock_out")
+    status: str = Field(..., description="present/absent/leave or clock_in/clock_out")
     note: Optional[str] = None
 
 
@@ -124,6 +124,7 @@ class PayrollRun(BaseModel):
     period_start: str
     period_end: str
     total_amount: float
+    created_at: Optional[str] = None
 
 
 # Error handler with request id
@@ -176,7 +177,7 @@ def get_conn():
         yield conn
 
 
-def require_user(request: Request) -> int:
+def get_user_and_role(request: Request, conn) -> Tuple[int, str]:
     auth = request.headers.get("authorization", "")
     if not auth.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing token")
@@ -186,9 +187,17 @@ def require_user(request: Request) -> int:
         uid = int(decoded.get("sub")) if decoded.get("sub") else None
         if not uid:
             raise HTTPException(status_code=401, detail="Invalid token")
-        return uid
+        row = conn.execute(text("SELECT id, role FROM dbo.users WHERE id=:i"), {"i": uid}).mappings().first()
+        role = row["role"] if row else "user"
+        return uid, role
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
+
+
+def require_role(role: str, user_role: str):
+    hierarchy = {"staff": 1, "manager": 2, "admin": 3}
+    if hierarchy.get(user_role, 0) < hierarchy.get(role, 0):
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
 
 
 # Auth endpoints (password-only for now)
@@ -226,7 +235,7 @@ def refresh_token(payload: RefreshRequest):
 # Profile and settings
 @app.get("/api/profile", response_model=Profile)
 def get_profile(request: Request, conn=Depends(get_conn)):
-    uid = require_user(request)
+    uid, _ = get_user_and_role(request, conn)
     user = conn.execute(
         text("SELECT id, username, role, display_name FROM dbo.users WHERE id=:i"),
         {"i": uid},
@@ -244,7 +253,9 @@ def get_profile(request: Request, conn=Depends(get_conn)):
 
 # Logo upload (stores URL in settings)
 @app.post("/api/settings/logo")
-def upload_logo(file: UploadFile = File(...), conn=Depends(get_conn)):
+def upload_logo(request: Request, file: UploadFile = File(...), conn=Depends(get_conn)):
+    # Require any authenticated user
+    get_user_and_role(request, conn)
     uploads_dir = os.path.join(os.getcwd(), "uploads")
     os.makedirs(uploads_dir, exist_ok=True)
     fname = f"logo_{datetime.now().strftime('%Y%m%d%H%M%S')}_{file.filename}"
@@ -263,17 +274,36 @@ def upload_logo(file: UploadFile = File(...), conn=Depends(get_conn)):
 
 # HR: Employees
 @app.get("/api/hr/employees", response_model=List[Employee])
-def list_employees(request: Request, conn=Depends(get_conn)):
-    require_user(request)
-    rows = conn.execute(text(
-        "SELECT id, first_name, last_name, email, phone, position, salary, CONVERT(VARCHAR(10), hire_date, 23) AS hire_date FROM dbo.employees ORDER BY id DESC"
-    )).mappings().all()
+def list_employees(
+    request: Request,
+    conn=Depends(get_conn),
+    q: Optional[str] = Query(None, description="Search by name/email/phone"),
+    limit: int = Query(200, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+):
+    get_user_and_role(request, conn)
+    where = []
+    params: Dict[str, Any] = {}
+    if q:
+        where.append("(first_name LIKE :q OR last_name LIKE :q OR email LIKE :q OR phone LIKE :q)")
+        params["q"] = f"%{q}%"
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+    sql = f"""
+        SELECT id, first_name, last_name, email, phone, position, salary,
+               CONVERT(VARCHAR(10), hire_date, 23) AS hire_date
+        FROM dbo.employees {where_sql}
+        ORDER BY id DESC
+        OFFSET :offset ROWS FETCH NEXT :limit ROWS ONLY
+    """
+    params.update({"limit": limit, "offset": offset})
+    rows = conn.execute(text(sql), params).mappings().all()
     return [Employee(**dict(r)) for r in rows]
 
 
 @app.post("/api/hr/employees", response_model=Employee, status_code=201)
 def create_employee(payload: EmployeeIn, request: Request, conn=Depends(get_conn)):
-    require_user(request)
+    _, role = get_user_and_role(request, conn)
+    require_role("manager", role)  # managers and admins can create/update
     result = conn.execute(text(
         """
         INSERT INTO dbo.employees (first_name, last_name, email, phone, position, salary, hire_date, created_at, updated_at)
@@ -290,7 +320,7 @@ def create_employee(payload: EmployeeIn, request: Request, conn=Depends(get_conn
 
 @app.get("/api/hr/employees/{emp_id}", response_model=Employee)
 def get_employee(emp_id: int = Path(...), request: Request = None, conn=Depends(get_conn)):
-    require_user(request)
+    get_user_and_role(request, conn)
     row = conn.execute(text(
         "SELECT id, first_name, last_name, email, phone, position, salary, CONVERT(VARCHAR(10), hire_date, 23) AS hire_date FROM dbo.employees WHERE id=:i"
     ), {"i": emp_id}).mappings().first()
@@ -301,7 +331,8 @@ def get_employee(emp_id: int = Path(...), request: Request = None, conn=Depends(
 
 @app.put("/api/hr/employees/{emp_id}", response_model=Employee)
 def update_employee(payload: EmployeeIn, emp_id: int = Path(...), request: Request = None, conn=Depends(get_conn)):
-    require_user(request)
+    _, role = get_user_and_role(request, conn)
+    require_role("manager", role)
     data = payload.dict()
     data["id"] = emp_id
     conn.execute(text(
@@ -317,23 +348,41 @@ def update_employee(payload: EmployeeIn, emp_id: int = Path(...), request: Reque
 
 # HR: Attendance
 @app.get("/api/hr/attendance")
-def list_attendance(employee_id: Optional[int] = None, request: Request = None, conn=Depends(get_conn)):
-    require_user(request)
+def list_attendance(
+    request: Request,
+    conn=Depends(get_conn),
+    employee_id: Optional[int] = Query(None),
+    status: Optional[str] = Query(None),
+    date_from: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    date_to: Optional[str] = Query(None, description="YYYY-MM-DD"),
+):
+    get_user_and_role(request, conn)
+    where = []
+    params: Dict[str, Any] = {}
     if employee_id:
-        rows = conn.execute(text(
-            "SELECT id, employee_id, status, note, CONVERT(VARCHAR(19), ts, 120) AS ts FROM dbo.attendance WHERE employee_id=:e ORDER BY ts DESC"
-        ), {"e": employee_id}).mappings().all()
-    else:
-        rows = conn.execute(text(
-            "SELECT id, employee_id, status, note, CONVERT(VARCHAR(19), ts, 120) AS ts FROM dbo.attendance ORDER BY ts DESC"
-        )).mappings().all()
+        where.append("employee_id=:e")
+        params["e"] = employee_id
+    if status:
+        where.append("status=:s")
+        params["s"] = status
+    if date_from:
+        where.append("CAST(ts AS DATE) >= TRY_CONVERT(DATE, :df)")
+        params["df"] = date_from
+    if date_to:
+        where.append("CAST(ts AS DATE) <= TRY_CONVERT(DATE, :dt)")
+        params["dt"] = date_to
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+    rows = conn.execute(text(
+        f"SELECT id, employee_id, status, note, CONVERT(VARCHAR(19), ts, 120) AS ts FROM dbo.attendance {where_sql} ORDER BY ts DESC"
+    ), params).mappings().all()
     return [dict(r) for r in rows]
 
 
 @app.post("/api/hr/attendance", status_code=201)
 def create_attendance(payload: AttendanceIn, request: Request, conn=Depends(get_conn)):
-    require_user(request)
-    if payload.status not in ("clock_in", "clock_out"):
+    _, role = get_user_and_role(request, conn)
+    # staff can record; everyone above too
+    if payload.status not in ("clock_in", "clock_out", "present", "absent", "leave"):
         raise HTTPException(status_code=400, detail="Invalid status")
     conn.execute(text(
         "INSERT INTO dbo.attendance (employee_id, status, note, ts) VALUES (:employee_id, :status, :note, SYSDATETIME())"
@@ -343,21 +392,42 @@ def create_attendance(payload: AttendanceIn, request: Request, conn=Depends(get_
 
 # HR: Leave Requests
 @app.get("/api/hr/leave", response_model=List[LeaveRequest])
-def list_leave(request: Request, conn=Depends(get_conn)):
-    require_user(request)
+def list_leave(
+    request: Request,
+    conn=Depends(get_conn),
+    status: Optional[str] = Query(None),
+    date_from: Optional[str] = Query(None),
+    date_to: Optional[str] = Query(None),
+):
+    get_user_and_role(request, conn)
+    where = []
+    params: Dict[str, Any] = {}
+    if status:
+        where.append("status=:s")
+        params["s"] = status
+    if date_from:
+        where.append("start_date >= TRY_CONVERT(DATE, :df)")
+        params["df"] = date_from
+    if date_to:
+        where.append("end_date <= TRY_CONVERT(DATE, :dt)")
+        params["dt"] = date_to
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
     rows = conn.execute(text(
-        """
+        f"""
         SELECT id, employee_id, leave_type, CONVERT(VARCHAR(10), start_date, 23) AS start_date,
                CONVERT(VARCHAR(10), end_date, 23) AS end_date, reason, status
-        FROM dbo.leave_requests ORDER BY id DESC
+        FROM dbo.leave_requests {where_sql} ORDER BY id DESC
         """
-    )).mappings().all()
+    ), params).mappings().all()
     return [LeaveRequest(**dict(r)) for r in rows]
 
 
 @app.post("/api/hr/leave", response_model=LeaveRequest, status_code=201)
 def create_leave(payload: LeaveRequestIn, request: Request, conn=Depends(get_conn)):
-    require_user(request)
+    uid, role = get_user_and_role(request, conn)
+    # staff allowed to submit for themselves; manager/admin can submit any
+    if role == "staff" and payload.employee_id != uid:
+        pass  # In this simple app, employee_id is independent of user id; allow creation
     params = payload.dict()
     result = conn.execute(text(
         """
@@ -379,7 +449,8 @@ class LeaveStatusUpdate(BaseModel):
 
 @app.put("/api/hr/leave/{leave_id}", response_model=LeaveRequest)
 def update_leave_status(leave_id: int, payload: LeaveStatusUpdate, request: Request, conn=Depends(get_conn)):
-    require_user(request)
+    _, role = get_user_and_role(request, conn)
+    require_role("manager", role)  # only manager/admin can approve/reject
     if payload.status not in ("pending", "approved", "rejected"):
         raise HTTPException(status_code=400, detail="Invalid status")
     conn.execute(text(
@@ -395,17 +466,32 @@ def update_leave_status(leave_id: int, payload: LeaveStatusUpdate, request: Requ
 
 # HR: Payroll
 @app.get("/api/hr/payroll/runs", response_model=List[PayrollRun])
-def list_payroll_runs(request: Request, conn=Depends(get_conn)):
-    require_user(request)
+def list_payroll_runs(
+    request: Request,
+    conn=Depends(get_conn),
+    date_from: Optional[str] = Query(None),
+    date_to: Optional[str] = Query(None),
+):
+    get_user_and_role(request, conn)
+    where = []
+    params: Dict[str, Any] = {}
+    if date_from:
+        where.append("period_start >= TRY_CONVERT(DATE, :df)")
+        params["df"] = date_from
+    if date_to:
+        where.append("period_end <= TRY_CONVERT(DATE, :dt)")
+        params["dt"] = date_to
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
     rows = conn.execute(text(
-        "SELECT id, CONVERT(VARCHAR(10), period_start, 23) AS period_start, CONVERT(VARCHAR(10), period_end, 23) AS period_end, total_amount FROM dbo.payroll_runs ORDER BY id DESC"
-    )).mappings().all()
+        f"SELECT id, CONVERT(VARCHAR(10), period_start, 23) AS period_start, CONVERT(VARCHAR(10), period_end, 23) AS period_end, total_amount, CONVERT(VARCHAR(19), created_at, 120) AS created_at FROM dbo.payroll_runs {where_sql} ORDER BY id DESC"
+    ), params).mappings().all()
     return [PayrollRun(**dict(r)) for r in rows]
 
 
 @app.post("/api/hr/payroll/runs", response_model=PayrollRun, status_code=201)
 def create_payroll_run(payload: PayrollRunIn, request: Request, conn=Depends(get_conn)):
-    require_user(request)
+    _, role = get_user_and_role(request, conn)
+    require_role("manager", role)
     # Simple payroll: sum active employee salaries prorated by days in period
     period_days = 1
     try:
@@ -429,9 +515,126 @@ def create_payroll_run(payload: PayrollRunIn, request: Request, conn=Depends(get
     ), {"ps": payload.period_start, "pe": payload.period_end, "ta": total_amount})
     new_id = int(list(result)[0][0])
     row = conn.execute(text(
-        "SELECT id, CONVERT(VARCHAR(10), period_start, 23) AS period_start, CONVERT(VARCHAR(10), period_end, 23) AS period_end, total_amount FROM dbo.payroll_runs WHERE id=:i"
+        "SELECT id, CONVERT(VARCHAR(10), period_start, 23) AS period_start, CONVERT(VARCHAR(10), period_end, 23) AS period_end, total_amount, CONVERT(VARCHAR(19), created_at, 120) AS created_at FROM dbo.payroll_runs WHERE id=:i"
     ), {"i": new_id}).mappings().first()
     return PayrollRun(**dict(row))
+
+
+# CSV export helpers
+
+def csv_response(filename: str, header: List[str], rows: List[List[Any]]):
+    import csv
+    from io import StringIO
+
+    sio = StringIO()
+    writer = csv.writer(sio)
+    writer.writerow(header)
+    for r in rows:
+        writer.writerow(r)
+    data = sio.getvalue()
+    return Response(content=data, media_type="text/csv", headers={
+        "Content-Disposition": f"attachment; filename={filename}"
+    })
+
+
+@app.get("/api/hr/employees/export")
+def export_employees(request: Request, conn=Depends(get_conn), q: Optional[str] = None):
+    get_user_and_role(request, conn)
+    where = []
+    params: Dict[str, Any] = {}
+    if q:
+        where.append("(first_name LIKE :q OR last_name LIKE :q OR email LIKE :q OR phone LIKE :q)")
+        params["q"] = f"%{q}%"
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+    rows = conn.execute(text(
+        f"SELECT id, first_name, last_name, email, phone, position, salary, CONVERT(VARCHAR(10), hire_date, 23) AS hire_date FROM dbo.employees {where_sql} ORDER BY id DESC"
+    ), params).all()
+    out = [[r.id, r.first_name, r.last_name, r.email or '', r.phone or '', r.position or '', r.salary or '', r.hire_date or ''] for r in rows]
+    return csv_response("employees.csv", ["ID","First Name","Last Name","Email","Phone","Position","Salary","Hire Date"], out)
+
+
+@app.get("/api/hr/attendance/export")
+def export_attendance(
+    request: Request,
+    conn=Depends(get_conn),
+    employee_id: Optional[int] = None,
+    status: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+):
+    get_user_and_role(request, conn)
+    where = []
+    params: Dict[str, Any] = {}
+    if employee_id:
+        where.append("employee_id=:e")
+        params["e"] = employee_id
+    if status:
+        where.append("status=:s")
+        params["s"] = status
+    if date_from:
+        where.append("CAST(ts AS DATE) >= TRY_CONVERT(DATE, :df)")
+        params["df"] = date_from
+    if date_to:
+        where.append("CAST(ts AS DATE) <= TRY_CONVERT(DATE, :dt)")
+        params["dt"] = date_to
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+    rows = conn.execute(text(
+        f"SELECT id, employee_id, status, note, CONVERT(VARCHAR(19), ts, 120) AS ts FROM dbo.attendance {where_sql} ORDER BY ts DESC"
+    ), params).all()
+    out = [[r.id, r.employee_id, r.status, r.note or '', r.ts] for r in rows]
+    return csv_response("attendance.csv", ["ID","Employee ID","Status","Note","Timestamp"], out)
+
+
+@app.get("/api/hr/leave/export")
+def export_leave(
+    request: Request,
+    conn=Depends(get_conn),
+    status: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+):
+    get_user_and_role(request, conn)
+    where = []
+    params: Dict[str, Any] = {}
+    if status:
+        where.append("status=:s")
+        params["s"] = status
+    if date_from:
+        where.append("start_date >= TRY_CONVERT(DATE, :df)")
+        params["df"] = date_from
+    if date_to:
+        where.append("end_date <= TRY_CONVERT(DATE, :dt)")
+        params["dt"] = date_to
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+    rows = conn.execute(text(
+        f"SELECT id, employee_id, leave_type, CONVERT(VARCHAR(10), start_date, 23) AS start_date, CONVERT(VARCHAR(10), end_date, 23) AS end_date, reason, status FROM dbo.leave_requests {where_sql} ORDER BY id DESC"
+    ), params).all()
+    out = [[r.id, r.employee_id, r.leave_type, r.start_date, r.end_date, r.reason or '', r.status] for r in rows]
+    return csv_response("leave.csv", ["ID","Employee ID","Type","Start","End","Reason","Status"], out)
+
+
+@app.get("/api/hr/payroll/runs/export")
+def export_payroll_runs(
+    request: Request,
+    conn=Depends(get_conn),
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+):
+    get_user_and_role(request, conn)
+    where = []
+    params: Dict[str, Any] = {}
+    if date_from:
+        where.append("period_start >= TRY_CONVERT(DATE, :df)")
+        params["df"] = date_from
+    if date_to:
+        where.append("period_end <= TRY_CONVERT(DATE, :dt)")
+        params["dt"] = date_to
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+    rows = conn.execute(text(
+        f"SELECT id, CONVERT(VARCHAR(10), period_start, 23) AS period_start, CONVERT(VARCHAR(10), period_end, 23) AS period_end, total_amount, CONVERT(VARCHAR(19), created_at, 120) AS created_at FROM dbo.payroll_runs {where_sql} ORDER BY id DESC"
+    ), params).all()
+    out = [[r.id, r.period_start, r.period_end, r.total_amount, r.created_at] for r in rows]
+    return csv_response("payroll_runs.csv", ["ID","Period Start","Period End","Total Amount","Created At"], out)
 
 
 # Admin bootstrap endpoint (idempotent): creates base tables and seeds admin + org settings
