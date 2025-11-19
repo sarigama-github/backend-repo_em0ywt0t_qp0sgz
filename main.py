@@ -11,6 +11,10 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import URL
 import jwt
 from passlib.context import CryptContext
+from dotenv import load_dotenv
+
+# Load environment variables from .env if present
+load_dotenv()
 
 # Ensure uploads directory exists before mounting static files (Starlette requires it)
 os.makedirs("uploads", exist_ok=True)
