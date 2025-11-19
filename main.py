@@ -12,8 +12,11 @@ from sqlalchemy.engine import URL
 import jwt
 from passlib.context import CryptContext
 
+# Ensure uploads directory exists before mounting static files (Starlette requires it)
+os.makedirs("uploads", exist_ok=True)
+
 # App setup
-app = FastAPI(title="MBF HR Backend", version="0.1.1")
+app = FastAPI(title="MBF HR Backend", version="0.1.2")
 
 app.add_middleware(
     CORSMiddleware,
