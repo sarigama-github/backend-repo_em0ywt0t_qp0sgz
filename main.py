@@ -1,12 +1,12 @@
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Optional, List, Dict, Any
 
-from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, Request, Query
+from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, Request, Query, Path
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import URL
 import jwt
@@ -20,7 +20,7 @@ load_dotenv()
 os.makedirs("uploads", exist_ok=True)
 
 # App setup
-app = FastAPI(title="MBF HR Backend", version="0.1.2")
+app = FastAPI(title="MBF HR Backend", version="0.1.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -80,6 +80,52 @@ class Profile(BaseModel):
     logo_url: Optional[str] = None
 
 
+# HR Schemas
+class EmployeeIn(BaseModel):
+    first_name: str
+    last_name: str
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    position: Optional[str] = None
+    salary: Optional[float] = Field(None, ge=0)
+    hire_date: Optional[str] = Field(None, description="YYYY-MM-DD")
+
+
+class Employee(EmployeeIn):
+    id: int
+
+
+class AttendanceIn(BaseModel):
+    employee_id: int
+    status: str = Field(..., description="clock_in or clock_out")
+    note: Optional[str] = None
+
+
+class LeaveRequestIn(BaseModel):
+    employee_id: int
+    leave_type: str = Field(..., description="annual, sick, unpaid, etc.")
+    start_date: str
+    end_date: str
+    reason: Optional[str] = None
+
+
+class LeaveRequest(LeaveRequestIn):
+    id: int
+    status: str
+
+
+class PayrollRunIn(BaseModel):
+    period_start: str
+    period_end: str
+
+
+class PayrollRun(BaseModel):
+    id: int
+    period_start: str
+    period_end: str
+    total_amount: float
+
+
 # Error handler with request id
 @app.middleware("http")
 async def add_request_context(request: Request, call_next):
@@ -120,7 +166,7 @@ def hash_password(plain: str) -> str:
     return pwd_context.hash(plain)
 
 
-# Connection dependency
+# Connection + auth helpers
 
 def get_conn():
     engine = get_engine()
@@ -128,6 +174,21 @@ def get_conn():
         raise HTTPException(status_code=503, detail="Database driver/connection not available")
     with engine.begin() as conn:
         yield conn
+
+
+def require_user(request: Request) -> int:
+    auth = request.headers.get("authorization", "")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing token")
+    token = auth.split(" ", 1)[1]
+    try:
+        decoded = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])  # type: ignore
+        uid = int(decoded.get("sub")) if decoded.get("sub") else None
+        if not uid:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        return uid
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
 
 
 # Auth endpoints (password-only for now)
@@ -150,7 +211,7 @@ class RefreshRequest(BaseModel):
 @app.post("/api/auth/refresh", response_model=TokenResponse)
 def refresh_token(payload: RefreshRequest):
     try:
-        decoded = jwt.decode(payload.refresh_token, JWT_SECRET, algorithms=["HS256"])
+        decoded = jwt.decode(payload.refresh_token, JWT_SECRET, algorithms=["HS256"])  # type: ignore
         if decoded.get("type") != "refresh":
             raise HTTPException(status_code=400, detail="Invalid token type")
         sub = decoded["sub"]
@@ -165,16 +226,7 @@ def refresh_token(payload: RefreshRequest):
 # Profile and settings
 @app.get("/api/profile", response_model=Profile)
 def get_profile(request: Request, conn=Depends(get_conn)):
-    auth = request.headers.get("authorization", "")
-    if not auth.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing token")
-    token = auth.split(" ", 1)[1]
-    try:
-        decoded = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-    except jwt.InvalidTokenError:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-    uid = int(decoded.get("sub")) if decoded.get("sub") else None
+    uid = require_user(request)
     user = conn.execute(
         text("SELECT id, username, role, display_name FROM dbo.users WHERE id=:i"),
         {"i": uid},
@@ -207,6 +259,179 @@ def upload_logo(file: UploadFile = File(...), conn=Depends(get_conn)):
         {"u": public_url},
     )
     return {"logo_url": public_url}
+
+
+# HR: Employees
+@app.get("/api/hr/employees", response_model=List[Employee])
+def list_employees(request: Request, conn=Depends(get_conn)):
+    require_user(request)
+    rows = conn.execute(text(
+        "SELECT id, first_name, last_name, email, phone, position, salary, CONVERT(VARCHAR(10), hire_date, 23) AS hire_date FROM dbo.employees ORDER BY id DESC"
+    )).mappings().all()
+    return [Employee(**dict(r)) for r in rows]
+
+
+@app.post("/api/hr/employees", response_model=Employee, status_code=201)
+def create_employee(payload: EmployeeIn, request: Request, conn=Depends(get_conn)):
+    require_user(request)
+    result = conn.execute(text(
+        """
+        INSERT INTO dbo.employees (first_name, last_name, email, phone, position, salary, hire_date, created_at, updated_at)
+        VALUES (:first_name, :last_name, :email, :phone, :position, :salary, TRY_CONVERT(DATE, :hire_date), SYSDATETIME(), SYSDATETIME());
+        SELECT SCOPE_IDENTITY() AS id;
+        """
+    ), payload.dict())
+    new_id = int(list(result)[0][0])
+    row = conn.execute(text(
+        "SELECT id, first_name, last_name, email, phone, position, salary, CONVERT(VARCHAR(10), hire_date, 23) AS hire_date FROM dbo.employees WHERE id=:i"
+    ), {"i": new_id}).mappings().first()
+    return Employee(**dict(row))
+
+
+@app.get("/api/hr/employees/{emp_id}", response_model=Employee)
+def get_employee(emp_id: int = Path(...), request: Request = None, conn=Depends(get_conn)):
+    require_user(request)
+    row = conn.execute(text(
+        "SELECT id, first_name, last_name, email, phone, position, salary, CONVERT(VARCHAR(10), hire_date, 23) AS hire_date FROM dbo.employees WHERE id=:i"
+    ), {"i": emp_id}).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Employee not found")
+    return Employee(**dict(row))
+
+
+@app.put("/api/hr/employees/{emp_id}", response_model=Employee)
+def update_employee(payload: EmployeeIn, emp_id: int = Path(...), request: Request = None, conn=Depends(get_conn)):
+    require_user(request)
+    data = payload.dict()
+    data["id"] = emp_id
+    conn.execute(text(
+        """
+        UPDATE dbo.employees
+        SET first_name=:first_name, last_name=:last_name, email=:email, phone=:phone,
+            position=:position, salary=:salary, hire_date=TRY_CONVERT(DATE, :hire_date), updated_at=SYSDATETIME()
+        WHERE id=:id
+        """
+    ), data)
+    return get_employee(emp_id, request, conn)
+
+
+# HR: Attendance
+@app.get("/api/hr/attendance")
+def list_attendance(employee_id: Optional[int] = None, request: Request = None, conn=Depends(get_conn)):
+    require_user(request)
+    if employee_id:
+        rows = conn.execute(text(
+            "SELECT id, employee_id, status, note, CONVERT(VARCHAR(19), ts, 120) AS ts FROM dbo.attendance WHERE employee_id=:e ORDER BY ts DESC"
+        ), {"e": employee_id}).mappings().all()
+    else:
+        rows = conn.execute(text(
+            "SELECT id, employee_id, status, note, CONVERT(VARCHAR(19), ts, 120) AS ts FROM dbo.attendance ORDER BY ts DESC"
+        )).mappings().all()
+    return [dict(r) for r in rows]
+
+
+@app.post("/api/hr/attendance", status_code=201)
+def create_attendance(payload: AttendanceIn, request: Request, conn=Depends(get_conn)):
+    require_user(request)
+    if payload.status not in ("clock_in", "clock_out"):
+        raise HTTPException(status_code=400, detail="Invalid status")
+    conn.execute(text(
+        "INSERT INTO dbo.attendance (employee_id, status, note, ts) VALUES (:employee_id, :status, :note, SYSDATETIME())"
+    ), payload.dict())
+    return {"ok": True}
+
+
+# HR: Leave Requests
+@app.get("/api/hr/leave", response_model=List[LeaveRequest])
+def list_leave(request: Request, conn=Depends(get_conn)):
+    require_user(request)
+    rows = conn.execute(text(
+        """
+        SELECT id, employee_id, leave_type, CONVERT(VARCHAR(10), start_date, 23) AS start_date,
+               CONVERT(VARCHAR(10), end_date, 23) AS end_date, reason, status
+        FROM dbo.leave_requests ORDER BY id DESC
+        """
+    )).mappings().all()
+    return [LeaveRequest(**dict(r)) for r in rows]
+
+
+@app.post("/api/hr/leave", response_model=LeaveRequest, status_code=201)
+def create_leave(payload: LeaveRequestIn, request: Request, conn=Depends(get_conn)):
+    require_user(request)
+    params = payload.dict()
+    result = conn.execute(text(
+        """
+        INSERT INTO dbo.leave_requests (employee_id, leave_type, start_date, end_date, reason, status, created_at, updated_at)
+        VALUES (:employee_id, :leave_type, TRY_CONVERT(DATE, :start_date), TRY_CONVERT(DATE, :end_date), :reason, 'pending', SYSDATETIME(), SYSDATETIME());
+        SELECT SCOPE_IDENTITY() AS id;
+        """
+    ), params)
+    new_id = int(list(result)[0][0])
+    row = conn.execute(text(
+        "SELECT id, employee_id, leave_type, CONVERT(VARCHAR(10), start_date, 23) AS start_date, CONVERT(VARCHAR(10), end_date, 23) AS end_date, reason, status FROM dbo.leave_requests WHERE id=:i"
+    ), {"i": new_id}).mappings().first()
+    return LeaveRequest(**dict(row))
+
+
+class LeaveStatusUpdate(BaseModel):
+    status: str = Field(..., description="pending/approved/rejected")
+
+
+@app.put("/api/hr/leave/{leave_id}", response_model=LeaveRequest)
+def update_leave_status(leave_id: int, payload: LeaveStatusUpdate, request: Request, conn=Depends(get_conn)):
+    require_user(request)
+    if payload.status not in ("pending", "approved", "rejected"):
+        raise HTTPException(status_code=400, detail="Invalid status")
+    conn.execute(text(
+        "UPDATE dbo.leave_requests SET status=:s, updated_at=SYSDATETIME() WHERE id=:i"
+    ), {"s": payload.status, "i": leave_id})
+    row = conn.execute(text(
+        "SELECT id, employee_id, leave_type, CONVERT(VARCHAR(10), start_date, 23) AS start_date, CONVERT(VARCHAR(10), end_date, 23) AS end_date, reason, status FROM dbo.leave_requests WHERE id=:i"
+    ), {"i": leave_id}).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Leave request not found")
+    return LeaveRequest(**dict(row))
+
+
+# HR: Payroll
+@app.get("/api/hr/payroll/runs", response_model=List[PayrollRun])
+def list_payroll_runs(request: Request, conn=Depends(get_conn)):
+    require_user(request)
+    rows = conn.execute(text(
+        "SELECT id, CONVERT(VARCHAR(10), period_start, 23) AS period_start, CONVERT(VARCHAR(10), period_end, 23) AS period_end, total_amount FROM dbo.payroll_runs ORDER BY id DESC"
+    )).mappings().all()
+    return [PayrollRun(**dict(r)) for r in rows]
+
+
+@app.post("/api/hr/payroll/runs", response_model=PayrollRun, status_code=201)
+def create_payroll_run(payload: PayrollRunIn, request: Request, conn=Depends(get_conn)):
+    require_user(request)
+    # Simple payroll: sum active employee salaries prorated by days in period
+    period_days = 1
+    try:
+        period_days = max(1, (datetime.fromisoformat(payload.period_end) - datetime.fromisoformat(payload.period_start)).days + 1)
+    except Exception:
+        pass
+    # Assuming monthly salary, approximate daily = salary/26 (biweekly) for simplicity
+    total_row = conn.execute(text(
+        "SELECT COALESCE(SUM(CAST(salary AS FLOAT)), 0) AS total FROM dbo.employees"
+    )).mappings().first()
+    monthly_total = float(total_row["total"]) if total_row and total_row["total"] is not None else 0.0
+    # rough pro-rate: days/30 of monthly total
+    total_amount = round((period_days / 30.0) * monthly_total, 2)
+
+    result = conn.execute(text(
+        """
+        INSERT INTO dbo.payroll_runs (period_start, period_end, total_amount, created_at)
+        VALUES (TRY_CONVERT(DATE, :ps), TRY_CONVERT(DATE, :pe), :ta, SYSDATETIME());
+        SELECT SCOPE_IDENTITY() AS id;
+        """
+    ), {"ps": payload.period_start, "pe": payload.period_end, "ta": total_amount})
+    new_id = int(list(result)[0][0])
+    row = conn.execute(text(
+        "SELECT id, CONVERT(VARCHAR(10), period_start, 23) AS period_start, CONVERT(VARCHAR(10), period_end, 23) AS period_end, total_amount FROM dbo.payroll_runs WHERE id=:i"
+    ), {"i": new_id}).mappings().first()
+    return PayrollRun(**dict(row))
 
 
 # Admin bootstrap endpoint (idempotent): creates base tables and seeds admin + org settings
@@ -242,6 +467,59 @@ def bootstrap(
                 logo_url NVARCHAR(400) NULL,
                 created_at DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
                 updated_at DATETIME2 NOT NULL DEFAULT SYSDATETIME()
+            );
+        END;
+
+        IF OBJECT_ID('dbo.employees', 'U') IS NULL
+        BEGIN
+            CREATE TABLE dbo.employees (
+                id INT IDENTITY(1,1) PRIMARY KEY,
+                first_name NVARCHAR(100) NOT NULL,
+                last_name NVARCHAR(100) NOT NULL,
+                email NVARCHAR(200) NULL,
+                phone NVARCHAR(50) NULL,
+                position NVARCHAR(100) NULL,
+                salary DECIMAL(18,2) NULL,
+                hire_date DATE NULL,
+                created_at DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
+                updated_at DATETIME2 NOT NULL DEFAULT SYSDATETIME()
+            );
+        END;
+
+        IF OBJECT_ID('dbo.attendance', 'U') IS NULL
+        BEGIN
+            CREATE TABLE dbo.attendance (
+                id INT IDENTITY(1,1) PRIMARY KEY,
+                employee_id INT NOT NULL,
+                status NVARCHAR(20) NOT NULL,
+                note NVARCHAR(400) NULL,
+                ts DATETIME2 NOT NULL DEFAULT SYSDATETIME()
+            );
+        END;
+
+        IF OBJECT_ID('dbo.leave_requests', 'U') IS NULL
+        BEGIN
+            CREATE TABLE dbo.leave_requests (
+                id INT IDENTITY(1,1) PRIMARY KEY,
+                employee_id INT NOT NULL,
+                leave_type NVARCHAR(50) NOT NULL,
+                start_date DATE NOT NULL,
+                end_date DATE NOT NULL,
+                reason NVARCHAR(500) NULL,
+                status NVARCHAR(20) NOT NULL DEFAULT 'pending',
+                created_at DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
+                updated_at DATETIME2 NOT NULL DEFAULT SYSDATETIME()
+            );
+        END;
+
+        IF OBJECT_ID('dbo.payroll_runs', 'U') IS NULL
+        BEGIN
+            CREATE TABLE dbo.payroll_runs (
+                id INT IDENTITY(1,1) PRIMARY KEY,
+                period_start DATE NOT NULL,
+                period_end DATE NOT NULL,
+                total_amount DECIMAL(18,2) NOT NULL DEFAULT 0,
+                created_at DATETIME2 NOT NULL DEFAULT SYSDATETIME()
             );
         END;
         """
