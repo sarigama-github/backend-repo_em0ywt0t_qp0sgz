@@ -1,6 +1,6 @@
 INFO:     Will watch for changes in these directories: ['/home/workspace']
 INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
-INFO:     Started reloader process [611] using StatReload
+INFO:     Started reloader process [713] using StatReload
 Process SpawnProcess-1:
 Traceback (most recent call last):
   File "/usr/local/lib/python3.13/multiprocessing/process.py", line 313, in _bootstrap
@@ -30,8 +30,6 @@ Traceback (most recent call last):
   File "/usr/local/lib/python3.13/site-packages/uvicorn/config.py", line 467, in load
     self.loaded_app = import_from_string(self.app)
                       ~~~~~~~~~~~~~~~~~~^^^^^^^^^^
-  File "/usr/local/lib/python3.13/site-packages/uvicorn/importer.py", line 24, in import_from_string
-    raise exc from None
   File "/usr/local/lib/python3.13/site-packages/uvicorn/importer.py", line 21, in import_from_string
     module = importlib.import_module(module_str)
   File "/usr/local/lib/python3.13/importlib/__init__.py", line 88, in import_module
@@ -45,4 +43,38 @@ Traceback (most recent call last):
   File "<frozen importlib._bootstrap>", line 488, in _call_with_frames_removed
   File "/home/workspace/main.py", line 10, in <module>
     from sqlalchemy import create_engine, text
-ModuleNotFoundError: No module named 'sqlalchemy'
+  File "/usr/local/lib/python3.13/site-packages/sqlalchemy/__init__.py", line 13, in <module>
+    from .engine import AdaptedConnection as AdaptedConnection
+  File "/usr/local/lib/python3.13/site-packages/sqlalchemy/engine/__init__.py", line 18, in <module>
+    from . import events as events
+  File "/usr/local/lib/python3.13/site-packages/sqlalchemy/engine/events.py", line 19, in <module>
+    from .base import Connection
+  File "/usr/local/lib/python3.13/site-packages/sqlalchemy/engine/base.py", line 30, in <module>
+    from .interfaces import BindTyping
+  File "/usr/local/lib/python3.13/site-packages/sqlalchemy/engine/interfaces.py", line 38, in <module>
+    from ..sql.compiler import Compiled as Compiled
+  File "/usr/local/lib/python3.13/site-packages/sqlalchemy/sql/__init__.py", line 14, in <module>
+    from .compiler import COLLECT_CARTESIAN_PRODUCTS as COLLECT_CARTESIAN_PRODUCTS
+  File "/usr/local/lib/python3.13/site-packages/sqlalchemy/sql/compiler.py", line 61, in <module>
+    from . import crud
+  File "/usr/local/lib/python3.13/site-packages/sqlalchemy/sql/crud.py", line 34, in <module>
+    from . import dml
+  File "/usr/local/lib/python3.13/site-packages/sqlalchemy/sql/dml.py", line 34, in <module>
+    from . import util as sql_util
+  File "/usr/local/lib/python3.13/site-packages/sqlalchemy/sql/util.py", line 46, in <module>
+    from .ddl import sort_tables as sort_tables  # noqa: F401
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.13/site-packages/sqlalchemy/sql/ddl.py", line 30, in <module>
+    from .elements import ClauseElement
+  File "/usr/local/lib/python3.13/site-packages/sqlalchemy/sql/elements.py", line 808, in <module>
+    class SQLCoreOperations(Generic[_T_co], ColumnOperators, TypingOnly):
+    ...<472 lines>...
+                ...
+  File "/usr/local/lib/python3.13/typing.py", line 1257, in _generic_init_subclass
+    super(Generic, cls).__init_subclass__(*args, **kwargs)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.13/site-packages/sqlalchemy/util/langhelpers.py", line 1988, in __init_subclass__
+    raise AssertionError(
+    ...<2 lines>...
+    )
+AssertionError: Class <class 'sqlalchemy.sql.elements.SQLCoreOperations'> directly inherits TypingOnly but has additional attributes {'__firstlineno__', '__static_attributes__'}.

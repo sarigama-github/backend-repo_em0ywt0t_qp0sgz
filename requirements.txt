@@ -6,7 +6,8 @@ pymongo==4.6.0
 requests==2.31.0
 email-validator==2.1.0
 SQLAlchemy==2.0.23
-pyodbc==5.1.0
+# pyodbc intentionally omitted in this environment to avoid build failures.
+# The backend degrades gracefully when ODBC/pyodbc is unavailable.
 python-multipart==0.0.9
 passlib[bcrypt]==1.7.4
 PyJWT==2.9.0
