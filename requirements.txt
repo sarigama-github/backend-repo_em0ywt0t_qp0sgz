@@ -5,7 +5,8 @@ pydantic>=2.9.0
 pymongo==4.6.0
 requests==2.31.0
 email-validator==2.1.0
-SQLAlchemy==2.0.23
+# Upgrade SQLAlchemy to a version compatible with Python 3.13
+SQLAlchemy==2.0.36
 # pyodbc intentionally omitted in this environment to avoid build failures.
 # The backend degrades gracefully when ODBC/pyodbc is unavailable.
 python-multipart==0.0.9
