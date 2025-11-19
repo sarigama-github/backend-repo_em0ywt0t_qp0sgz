@@ -2,7 +2,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, Request
+from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -35,6 +35,7 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret-change-me")
 JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "30"))
 REFRESH_EXPIRE_DAYS = int(os.getenv("REFRESH_EXPIRE_DAYS", "7"))
+BOOTSTRAP_KEY = os.getenv("BOOTSTRAP_KEY", "dev-bootstrap")
 
 # Database (SQL Server) - do NOT hard-fail on startup
 SQL_SERVER_CONN = os.getenv(
@@ -206,6 +207,76 @@ def upload_logo(file: UploadFile = File(...), conn=Depends(get_conn)):
         {"u": public_url},
     )
     return {"logo_url": public_url}
+
+
+# Admin bootstrap endpoint (idempotent): creates base tables and seeds admin + org settings
+@app.post("/api/admin/bootstrap")
+def bootstrap(
+    key: str = Query(..., description="Protection key; must match BOOTSTRAP_KEY env var"),
+    conn=Depends(get_conn),
+):
+    if key != BOOTSTRAP_KEY:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    # Create tables if they don't exist
+    conn.execute(text(
+        """
+        IF OBJECT_ID('dbo.users', 'U') IS NULL
+        BEGIN
+            CREATE TABLE dbo.users (
+                id INT IDENTITY(1,1) PRIMARY KEY,
+                username NVARCHAR(100) NOT NULL UNIQUE,
+                password_hash NVARCHAR(255) NOT NULL,
+                role NVARCHAR(50) NOT NULL DEFAULT 'admin',
+                display_name NVARCHAR(150) NULL,
+                created_at DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
+                updated_at DATETIME2 NOT NULL DEFAULT SYSDATETIME()
+            );
+        END;
+
+        IF OBJECT_ID('dbo.org_settings', 'U') IS NULL
+        BEGIN
+            CREATE TABLE dbo.org_settings (
+                id INT IDENTITY(1,1) PRIMARY KEY,
+                currency NVARCHAR(10) NOT NULL DEFAULT 'TOP',
+                logo_url NVARCHAR(400) NULL,
+                created_at DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
+                updated_at DATETIME2 NOT NULL DEFAULT SYSDATETIME()
+            );
+        END;
+        """
+    ))
+
+    # Seed org settings if empty
+    conn.execute(text(
+        """
+        IF NOT EXISTS (SELECT 1 FROM dbo.org_settings)
+        BEGIN
+            INSERT INTO dbo.org_settings (currency) VALUES ('TOP');
+        END;
+        """
+    ))
+
+    # Seed admin user if not exists
+    admin_user = "admin"
+    admin_pass_env = os.getenv("ADMIN_DEFAULT_PASSWORD", "ChangeMe123!")
+    admin_hash = hash_password(admin_pass_env)
+    conn.execute(text(
+        """
+        IF NOT EXISTS (SELECT 1 FROM dbo.users WHERE username = :u)
+        BEGIN
+            INSERT INTO dbo.users (username, password_hash, role, display_name)
+            VALUES (:u, :h, 'admin', 'Administrator');
+        END;
+        """
+    ), {"u": admin_user, "h": admin_hash})
+
+    return {
+        "status": "ok",
+        "message": "Bootstrap completed (idempotent)",
+        "admin_username": admin_user,
+        "admin_password_hint": "Use ADMIN_DEFAULT_PASSWORD env var to control initial password",
+    }
 
 
 # Static files for uploads
