@@ -7,8 +7,8 @@ requests==2.31.0
 email-validator==2.1.0
 # Upgrade SQLAlchemy to a version compatible with Python 3.13
 SQLAlchemy==2.0.36
-# pyodbc intentionally omitted in this environment to avoid build failures.
-# The backend degrades gracefully when ODBC/pyodbc is unavailable.
+# Enable SQL Server connectivity via ODBC. A system ODBC driver is still required at runtime.
+pyodbc==5.1.0
 python-multipart==0.0.9
 passlib[bcrypt]==1.7.4
 PyJWT==2.9.0
